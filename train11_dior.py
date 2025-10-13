@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 
 # 加载一个预训练的 YOLO11n 模型
-model = YOLO("/home/lwt/mjl/YOLO/ultralytics-main1/yolo11n.yaml").load("/home/lwt/mjl/YOLO/ultralytics-main1/yolo11n.pt")
+model = YOLO("/home/YOLO/ultralytics-main1/yolo11n.yaml").load("/home/YOLO/ultralytics-main1/yolo11n.pt")
 
 # 在 crowdhuman 数据集上训练模型 100 个周期
 train_results = model.train(
