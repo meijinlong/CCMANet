@@ -1,7 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Block modules."""
 
-from __future__ import annotations
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -43,8 +43,10 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "C3k2",
+    "MyC3k2",
     "C2fPSA",
     "C2PSA",
+    "MyC2PSA",
     "RepVGGDW",
     "CIB",
     "C2fCIB",
@@ -192,7 +194,7 @@ class HGBlock(nn.Module):
 class SPP(nn.Module):
     """Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729."""
 
-    def __init__(self, c1: int, c2: int, k: tuple[int, ...] = (5, 9, 13)):
+    def __init__(self, c1: int, c2: int, k: Tuple[int, ...] = (5, 9, 13)):
         """
         Initialize the SPP layer with input/output channels and pooling kernel sizes.
 
@@ -213,7 +215,7 @@ class SPP(nn.Module):
         return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
 
 
-class SPPF(nn.Module):
+class MySPPF(nn.Module):
     """Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher."""
 
     def __init__(self, c1: int, c2: int, k: int = 5):
@@ -231,11 +233,36 @@ class SPPF(nn.Module):
         super().__init__()
         c_ = c1 // 2  # hidden channels
         self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.cv2 = Conv(c_ * 7, c2, 1, 1)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.m1 = nn.AvgPool2d(kernel_size=k, stride=1, padding=k // 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply sequential pooling operations to input and return concatenated feature maps."""
+        y = [self.cv1(x)]
+        y1 = [self.cv1(x)]
+        y.extend(self.m(y[-1]) for _ in range(3))
+        y1.extend(self.m1(y[-1]) for _ in range(3))
+        y.extend(y1[1:])
+        return self.cv2(torch.cat(y, 1))
+
+class SPPF(nn.Module):
+    """Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher."""
+
+    def __init__(self, c1, c2, k=5):
+        """
+        Initializes the SPPF layer with given input/output channels and kernel size.
+
+        This module is equivalent to SPP(k=(5, 9, 13)).
+        """
+        super().__init__()
+        c_ = c1 // 2  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x):
+        """Forward pass through Ghost Convolution block."""
         y = [self.cv1(x)]
         y.extend(self.m(y[-1]) for _ in range(3))
         return self.cv2(torch.cat(y, 1))
@@ -325,6 +352,34 @@ class C2f(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
 
+class MyC2f(nn.Module):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, g: int = 1, e: float = 0.5):
+
+        super().__init__()
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+
+        self.cv3 = Conv( self.c, self.c, 1) 
+        self.cv4 = Conv(c1, c2, 1) 
+
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+
+        self.pool  = nn.MaxPool2d(3,1,1)
+        self.eca = ECAAttention(self.c)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through C2f layer."""
+        y = list(self.cv1(x).chunk(2, 1))
+        identity = self.cv3(y[-1])
+        y.extend(m(y[-1] + identity) for m in self.m)
+
+        # out = self.cv2(torch.cat(y, 1))
+        out = self.eca(self.cv2(torch.cat(y, 1)) + self.pool(self.cv4(x)))
+        return out 
+
 
 class C3(nn.Module):
     """CSP Bottleneck with 3 convolutions."""
@@ -351,6 +406,26 @@ class C3(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through the CSP bottleneck with 3 convolutions."""
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+
+class MyC3(nn.Module):
+    """CSP Bottleneck with 3 convolutions."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = True, g: int = 1, e: float = 0.5):
+
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=((1, 1), (3, 3)), e=1.0) for _ in range(n)))
+        self.sim = SimAM()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the CSP bottleneck with 3 convolutions."""
+        # out = self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+        out = self.sim(self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1)))
+        return out
+
 
 
 class C3x(C3):
@@ -471,7 +546,7 @@ class Bottleneck(nn.Module):
     """Standard bottleneck."""
 
     def __init__(
-        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), e: float = 0.5
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: Tuple[int, int] = (3, 3), e: float = 0.5
     ):
         """
         Initialize a standard bottleneck module.
@@ -711,7 +786,7 @@ class ImagePoolingAttn(nn.Module):
     """ImagePoolingAttn: Enhance the text embeddings with image-aware information."""
 
     def __init__(
-        self, ec: int = 256, ch: tuple[int, ...] = (), ct: int = 512, nh: int = 8, k: int = 3, scale: bool = False
+        self, ec: int = 256, ch: Tuple[int, ...] = (), ct: int = 512, nh: int = 8, k: int = 3, scale: bool = False
     ):
         """
         Initialize ImagePoolingAttn module.
@@ -740,12 +815,12 @@ class ImagePoolingAttn(nn.Module):
         self.hc = ec // nh
         self.k = k
 
-    def forward(self, x: list[torch.Tensor], text: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: List[torch.Tensor], text: torch.Tensor) -> torch.Tensor:
         """
         Forward pass of ImagePoolingAttn.
 
         Args:
-            x (list[torch.Tensor]): List of input feature maps.
+            x (List[torch.Tensor]): List of input feature maps.
             text (torch.Tensor): Text embeddings.
 
         Returns:
@@ -856,7 +931,7 @@ class RepBottleneck(Bottleneck):
     """Rep bottleneck."""
 
     def __init__(
-        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: tuple[int, int] = (3, 3), e: float = 0.5
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, k: Tuple[int, int] = (3, 3), e: float = 0.5
     ):
         """
         Initialize RepBottleneck.
@@ -1026,13 +1101,13 @@ class SPPELAN(nn.Module):
 class CBLinear(nn.Module):
     """CBLinear."""
 
-    def __init__(self, c1: int, c2s: list[int], k: int = 1, s: int = 1, p: int | None = None, g: int = 1):
+    def __init__(self, c1: int, c2s: List[int], k: int = 1, s: int = 1, p: Optional[int] = None, g: int = 1):
         """
         Initialize CBLinear module.
 
         Args:
             c1 (int): Input channels.
-            c2s (list[int]): List of output channel sizes.
+            c2s (List[int]): List of output channel sizes.
             k (int): Kernel size.
             s (int): Stride.
             p (int | None): Padding.
@@ -1042,7 +1117,7 @@ class CBLinear(nn.Module):
         self.c2s = c2s
         self.conv = nn.Conv2d(c1, sum(c2s), k, s, autopad(k, p), groups=g, bias=True)
 
-    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         """Forward pass through CBLinear layer."""
         return self.conv(x).split(self.c2s, dim=1)
 
@@ -1050,22 +1125,22 @@ class CBLinear(nn.Module):
 class CBFuse(nn.Module):
     """CBFuse."""
 
-    def __init__(self, idx: list[int]):
+    def __init__(self, idx: List[int]):
         """
         Initialize CBFuse module.
 
         Args:
-            idx (list[int]): Indices for feature selection.
+            idx (List[int]): Indices for feature selection.
         """
         super().__init__()
         self.idx = idx
 
-    def forward(self, xs: list[torch.Tensor]) -> torch.Tensor:
+    def forward(self, xs: List[torch.Tensor]) -> torch.Tensor:
         """
         Forward pass through CBFuse layer.
 
         Args:
-            xs (list[torch.Tensor]): List of input tensors.
+            xs (List[torch.Tensor]): List of input tensors.
 
         Returns:
             (torch.Tensor): Fused output tensor.
@@ -1127,6 +1202,14 @@ class C3k2(C2f):
             C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n)
         )
 
+class MyC3k2(MyC2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, c3k: bool = False, e: float = 0.5, g: int = 1, shortcut: bool = True):
+
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(MyC3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g) for _ in range(n))
+
 
 class C3k(C3):
     """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
@@ -1144,6 +1227,15 @@ class C3k(C3):
             e (float): Expansion ratio.
             k (int): Kernel size.
         """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+
+class MyC3k(MyC3):
+    """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = True, g: int = 1, e: float = 0.5, k: int = 3):
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)  # hidden channels
         # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
@@ -1413,6 +1505,88 @@ class PSABlock(nn.Module):
         x = x + self.ffn(x) if self.add else self.ffn(x)
         return x
 
+import math
+
+class ECAAttention(nn.Module):
+    def __init__(self, channel, gamma=2, b=1):
+        super(ECAAttention, self).__init__()
+        t = int(abs((math.log2(channel) + b) / gamma))
+        k = t if t % 2 else t + 1  # 保证卷积核大小为奇数
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)  # [B, C, 1, 1]
+        y = y.squeeze(-1).transpose(-1, -2)  # [B, 1, C]
+        y = self.conv(y)  # [B, 1, C]
+        y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)  # [B, C, 1, 1]
+        return x * y.expand_as(x)
+
+class CoordAttention(nn.Module):
+    def __init__(self, in_channels, out_channels=None, reduction=32):
+        super().__init__()
+        out_channels = out_channels or in_channels
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, in_channels // reduction)
+
+        self.conv1 = nn.Conv2d(in_channels, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
+
+        self.conv_h = nn.Conv2d(mip, out_channels, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, out_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+
+        x_h = self.pool_h(x)  # [n, c, h, 1]
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)  # [n, c, 1, w]
+
+        y = torch.cat([x_h, x_w], dim=2)  # [n, c, h + w, 1]
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        out = identity * a_h * a_w
+        return out
+
+class MyPSABlock(nn.Module):
+
+    def __init__(self, c: int, attn_ratio: float = 0.5, num_heads: int = 4, shortcut: bool = True) -> None:
+        super().__init__()
+
+        # self.attn = ABlock(c, num_heads,attn_ratio)
+        # self.attn = AAttn(c, num_heads,4)
+        # self.attn = CoordAttention(c,c)
+        self.attn = Attention(c, attn_ratio=attn_ratio, num_heads=num_heads)
+        self.ffn = nn.Sequential(Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False))
+        self.add = shortcut
+
+        self.cv1 = Conv(4*c,c)
+        self.pool = nn.MaxPool2d(3,1,1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pa = self.pool(x)
+        x_a = self.attn(x)
+        x_f = self.ffn(x)
+        x = x + x_a if self.add else x_a
+        x = x + x_f if self.add else x_f
+        out = torch.cat((x,pa,x_a,x_f),1)
+        
+        # print("ayyyyyyyyyy")
+        return self.cv1(out)
+
+
 
 class PSA(nn.Module):
     """
@@ -1528,6 +1702,27 @@ class C2PSA(nn.Module):
         a, b = self.cv1(x).split((self.c, self.c), dim=1)
         b = self.m(b)
         return self.cv2(torch.cat((a, b), 1))
+
+class MyC2PSA(nn.Module):
+
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5):
+
+        super().__init__()
+        assert c1 == c2
+        self.c = int(c1 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv(3 * self.c , c1, 1)
+
+        self.pool = nn.MaxPool2d(3,1,1)
+
+        self.m = nn.Sequential(*(MyPSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64) for _ in range(n)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # print("my.......")
+
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)
+        b = self.m(b)
+        return self.cv2(torch.cat((a, b , self.pool(a)), 1)) 
 
 
 class C2fPSA(C2f):
@@ -1676,7 +1871,7 @@ class TorchVision(nn.Module):
             x (torch.Tensor): Input tensor.
 
         Returns:
-            (torch.Tensor | list[torch.Tensor]): Output tensor or list of tensors.
+            (torch.Tensor | List[torch.Tensor]): Output tensor or list of tensors.
         """
         if self.split:
             y = [x]
@@ -1921,7 +2116,7 @@ class A2C2f(nn.Module):
         y.extend(m(y[-1]) for m in self.m)
         y = self.cv2(torch.cat(y, 1))
         if self.gamma is not None:
-            return x + self.gamma.view(-1, self.gamma.shape[0], 1, 1) * y
+            return x + self.gamma.view(-1, len(self.gamma), 1, 1) * y
         return y
 
 
@@ -1974,12 +2169,12 @@ class Residual(nn.Module):
 class SAVPE(nn.Module):
     """Spatial-Aware Visual Prompt Embedding module for feature enhancement."""
 
-    def __init__(self, ch: list[int], c3: int, embed: int):
+    def __init__(self, ch: List[int], c3: int, embed: int):
         """
         Initialize SAVPE module with channels, intermediate channels, and embedding dimension.
 
         Args:
-            ch (list[int]): List of input channel dimensions.
+            ch (List[int]): List of input channel dimensions.
             c3 (int): Intermediate channels.
             embed (int): Embedding dimension.
         """
@@ -2002,7 +2197,7 @@ class SAVPE(nn.Module):
         self.cv5 = nn.Conv2d(1, self.c, 3, padding=1)
         self.cv6 = nn.Sequential(Conv(2 * self.c, self.c, 3), nn.Conv2d(self.c, self.c, 3, padding=1))
 
-    def forward(self, x: list[torch.Tensor], vp: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: List[torch.Tensor], vp: torch.Tensor) -> torch.Tensor:
         """Process input features and visual prompts to generate enhanced embeddings."""
         y = [self.cv2[i](xi) for i, xi in enumerate(x)]
         y = self.cv4(torch.cat(y, dim=1))
@@ -2025,7 +2220,27 @@ class SAVPE(nn.Module):
         vp = vp.reshape(B, Q, 1, -1)
 
         score = y * vp + torch.logical_not(vp) * torch.finfo(y.dtype).min
-        score = F.softmax(score, dim=-1).to(y.dtype)
+
+        score = F.softmax(score, dim=-1, dtype=torch.float).to(score.dtype)
+
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+    
+
+class SimAM(nn.Module):
+    def __init__(self, e_lambda=1e-4):
+        super(SimAM, self).__init__()
+        self.e_lambda = e_lambda
+
+    def forward(self, x):
+        B, C, H, W = x.size()
+        n = H * W - 1
+
+        x_mean = x.mean(dim=[2, 3], keepdim=True)
+        x_var = ((x - x_mean) ** 2).sum(dim=[2, 3], keepdim=True) / n
+
+        energy = ((x - x_mean) ** 2) / (4 * (x_var + self.e_lambda)) + 0.5
+        attention = torch.sigmoid(energy)
+
+        return x * attention
