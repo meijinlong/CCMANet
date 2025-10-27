@@ -8,7 +8,7 @@ train_results = model.train(
     data="dior.yaml",  # 数据集配置文件路径
     epochs=300,  # 训练周期数
     imgsz=800,  # 训练图像尺寸
-    batch=8,   #batch_size
+    batch=8,  # batch_size
     device=0,  # 运行设备（例如 'cpu', 0, [0,1,2,3]）
 )
 
